@@ -1,620 +1,713 @@
-import { useState, useEffect } from 'react';
+import { useMemo, useState, type ReactNode } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { useAuth } from '@/contexts/AuthContext';
+import { useQuery, type UseQueryResult } from '@tanstack/react-query';
+import { ArrowLeft, CalendarIcon, Download, Loader2, Star } from 'lucide-react';
+import { addDays, format, startOfDay, subDays } from 'date-fns';
+import type { DateRange } from 'react-day-picker';
+import {
+  Bar,
+  BarChart,
+  CartesianGrid,
+  Legend,
+  Line,
+  LineChart,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from 'recharts';
 import { supabase } from '@/lib/supabase';
 import { Button } from '@/components/ui/button';
-import { ArrowLeft, Loader2, Clock, CheckCircle, AlertCircle, BarChart3, User } from 'lucide-react';
-import { format, subDays, startOfDay } from 'date-fns';
-import { toast } from 'sonner';
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from '@/components/ui/select';
+import { Calendar } from '@/components/ui/calendar';
+import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 
-interface Stats {
-  total: number;
-  pending: number;
-  inProgress: number;
-  resolved: number;
-  myTickets: number;
-  resolvedToday: number;
-}
+// ---------------------------------------------------------------------------
+// Support Analytics dashboard. All numbers come from the database functions
+// dashboard_overview / dashboard_agents / dashboard_csat (totals only).
+// ---------------------------------------------------------------------------
 
-interface ResponseMetrics {
-  avgFirstResponse: string;
-  avgMessageResponse: string;
-  avgResolution: string;
-}
+type TabKey = 'overview' | 'agents' | 'csat';
+type RangeKey = 'today' | '7d' | '30d' | '90d' | 'custom';
+type Cell = string | number | null | undefined;
 
-interface IssueCategoryData {
-  issueType: string;
-  count: number;
-  avgResolutionTime: string;
-}
+const RANGE_OPTIONS: { value: RangeKey; label: string }[] = [
+  { value: 'today', label: 'Today' },
+  { value: '7d', label: 'Last 7 days' },
+  { value: '30d', label: 'Last 30 days' },
+  { value: '90d', label: 'Last 90 days' },
+  { value: 'custom', label: 'Custom range' },
+];
 
-interface AgentPerformance {
-  agentName: string;
-  ticketsClosed: number;
-  avgResponseTime: string;
-  resolvedToday: number;
-}
+const TAB_LABELS: Record<TabKey, string> = { overview: 'Overview', agents: 'Agents', csat: 'CSAT' };
 
-interface HourlyData {
-  hour: string;
-  created: number;
-  resolved: number;
-}
+const COLORS = {
+  aiOnly: '#2a78d6',
+  aiThenAgent: '#eb6834',
+  agentOnly: '#17917f',
+  star: '#f5a623',
+};
 
-const Dashboard = () => {
-  const navigate = useNavigate();
-  const { profile } = useAuth();
-  const [stats, setStats] = useState<Stats>({
-    total: 0,
-    pending: 0,
-    inProgress: 0,
-    resolved: 0,
-    myTickets: 0,
-    resolvedToday: 0,
-  });
-  const [responseMetrics, setResponseMetrics] = useState<ResponseMetrics>({
-    avgFirstResponse: '0h 0m',
-    avgMessageResponse: '0h 0m',
-    avgResolution: '0h 0m',
-  });
-  const [issueCategories, setIssueCategories] = useState<IssueCategoryData[]>([]);
-  const [agentPerformance, setAgentPerformance] = useState<AgentPerformance[]>([]);
-  const [hourlyData, setHourlyData] = useState<HourlyData[]>([]);
-  const [volumeTrend, setVolumeTrend] = useState<{ date: string; count: number }[]>([]);
-  const [volumePeriod, setVolumePeriod] = useState<'day' | 'week' | 'month'>('week');
-  const [issueCategoryPeriod, setIssueCategoryPeriod] = useState<'1h' | '1d' | '1w' | '1m'>('1w');
-  const [agentPeriod, setAgentPeriod] = useState<'1h' | '1d' | '1w' | '1m'>('1w');
-  const [loading, setLoading] = useState(true);
-  const [cachedTickets, setCachedTickets] = useState<any[]>([]);
-  const [cachedMessages, setCachedMessages] = useState<any[]>([]);
+const BOTH_COUNTS_NOTE =
+  'A ticket that AI started and an agent resolved counts in both Handled by AI and Assigned and Resolved by Agent.';
 
-  useEffect(() => {
-    if (cachedTickets.length === 0) {
-      fetchDashboardData();
-    } else {
-      fetchIssueCategories(cachedTickets, cachedMessages);
-      fetchAgentPerformance(cachedTickets, cachedMessages);
-      fetchVolumeTrend(cachedTickets);
-    }
-  }, [profile, volumePeriod, issueCategoryPeriod, agentPeriod]);
+// --- Date range -------------------------------------------------------------
 
-  const formatDuration = (minutes: number): string => {
-    if (minutes < 60) return `${Math.round(minutes)}m`;
-    const hours = Math.floor(minutes / 60);
-    const mins = Math.round(minutes % 60);
-    return `${hours}h ${mins}m`;
-  };
-
-  const fetchIssueCategories = (tickets: any[], messages: any[]) => {
-    const now = new Date();
-    let categoryTickets = tickets;
-    
-    if (issueCategoryPeriod === '1h') {
-      categoryTickets = tickets.filter(t => new Date(t.created_at) >= new Date(now.getTime() - 60 * 60 * 1000));
-    } else if (issueCategoryPeriod === '1d') {
-      categoryTickets = tickets.filter(t => new Date(t.created_at) >= startOfDay(now));
-    } else if (issueCategoryPeriod === '1w') {
-      categoryTickets = tickets.filter(t => new Date(t.created_at) >= subDays(now, 7));
-    } else if (issueCategoryPeriod === '1m') {
-      categoryTickets = tickets.filter(t => new Date(t.created_at) >= subDays(now, 30));
-    }
-
-    const categoryMap = new Map<string, { count: number; resolutionTimes: number[] }>();
-    categoryTickets.forEach(t => {
-      const existing = categoryMap.get(t.issue_type) || { count: 0, resolutionTimes: [] };
-      existing.count++;
-      if (t.status === 'Resolved') {
-        const resTime = (new Date(t.updated_at).getTime() - new Date(t.created_at).getTime()) / (1000 * 60);
-        existing.resolutionTimes.push(resTime);
+function getRange(key: RangeKey, custom?: DateRange): { from: Date; to: Date } {
+  const tomorrow = startOfDay(addDays(new Date(), 1));
+  switch (key) {
+    case 'today':
+      return { from: startOfDay(new Date()), to: tomorrow };
+    case '30d':
+      return { from: subDays(tomorrow, 30), to: tomorrow };
+    case '90d':
+      return { from: subDays(tomorrow, 90), to: tomorrow };
+    case 'custom':
+      if (custom?.from) {
+        return { from: startOfDay(custom.from), to: startOfDay(addDays(custom.to ?? custom.from, 1)) };
       }
-      categoryMap.set(t.issue_type, existing);
-    });
+      return { from: subDays(tomorrow, 7), to: tomorrow };
+    case '7d':
+    default:
+      return { from: subDays(tomorrow, 7), to: tomorrow };
+  }
+}
 
-    const categories: IssueCategoryData[] = Array.from(categoryMap.entries()).map(([type, data]) => ({
-      issueType: type,
-      count: data.count,
-      avgResolutionTime: data.resolutionTimes.length > 0
-        ? formatDuration(data.resolutionTimes.reduce((a, b) => a + b, 0) / data.resolutionTimes.length)
-        : 'N/A',
-    })).sort((a, b) => b.count - a.count);
+// --- Formatting -------------------------------------------------------------
 
-    setIssueCategories(categories);
+const fmtInt = (n: number | null | undefined) => (n == null ? '0' : Number(n).toLocaleString());
+
+const fmtCsat = (n: number | null | undefined) => (n == null ? '—' : Number(n).toFixed(1));
+
+function fmtDuration(sec: number | null | undefined): string {
+  if (sec == null) return '—';
+  const totalMin = Math.round(Number(sec) / 60);
+  if (totalMin < 60) return `${totalMin}m`;
+  return `${Math.floor(totalMin / 60)}h ${totalMin % 60}m`;
+}
+
+const fmtRate = (r: number | null | undefined) => (r == null ? '—' : `${Math.round(Number(r) * 100)}%`);
+
+function changeText(
+  cur: number | null | undefined,
+  prev: number | null | undefined,
+  kind: 'pct' | 'abs' | 'pts' = 'pct',
+): string | undefined {
+  if (cur == null || prev == null) return undefined;
+  const c = Number(cur);
+  const p = Number(prev);
+  if (kind === 'pct') {
+    if (p === 0) return undefined;
+    const pct = ((c - p) / p) * 100;
+    return `${pct >= 0 ? '↑' : '↓'} ${Math.abs(Math.round(pct))}% vs prev`;
+  }
+  if (kind === 'pts') {
+    const d = (c - p) * 100;
+    return `${d >= 0 ? '↑' : '↓'} ${Math.abs(Math.round(d))} pts vs prev`;
+  }
+  const d = c - p;
+  return `${d >= 0 ? '↑' : '↓'} ${Math.abs(d).toFixed(1)} vs prev`;
+}
+
+function bucketLabel(bucket: string, unit: string): string {
+  const [y, m, d] = bucket.split('-').map(Number);
+  const date = new Date(y, m - 1, d);
+  if (unit === 'month') return format(date, 'MMM yyyy');
+  if (unit === 'week') return `Wk ${format(date, 'MMM d')}`;
+  return format(date, 'MMM d');
+}
+
+// --- Data -------------------------------------------------------------------
+
+async function callRpc(fn: string, args: Record<string, unknown> = {}) {
+  const { data, error } = await supabase.rpc(fn, args);
+  if (error) throw error;
+  return data as any;
+}
+
+// --- CSV export -------------------------------------------------------------
+
+function downloadCsv(filename: string, rows: Cell[][]) {
+  const escape = (v: Cell) => {
+    const s = v == null ? '' : String(v);
+    return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
   };
+  const csv = rows.map((r) => r.map(escape).join(',')).join('\n');
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+}
 
-  const fetchAgentPerformance = async (tickets: any[], messages: any[]) => {
-    const now = new Date();
-    const today = startOfDay(new Date());
-    let agentTickets = tickets;
-    
-    if (agentPeriod === '1h') {
-      agentTickets = tickets.filter(t => new Date(t.created_at) >= new Date(now.getTime() - 60 * 60 * 1000));
-    } else if (agentPeriod === '1d') {
-      agentTickets = tickets.filter(t => new Date(t.created_at) >= startOfDay(now));
-    } else if (agentPeriod === '1w') {
-      agentTickets = tickets.filter(t => new Date(t.created_at) >= subDays(now, 7));
-    } else if (agentPeriod === '1m') {
-      agentTickets = tickets.filter(t => new Date(t.created_at) >= subDays(now, 30));
-    }
+function overviewCsv(d: any): Cell[][] {
+  const c = d.current ?? {};
+  const p = d.previous ?? {};
+  return [
+    ['Metric', 'This period', 'Previous period'],
+    ['Total tickets', c.total, p.total],
+    ['Handled by AI', c.handled_by_ai ?? '—', p.handled_by_ai ?? '—'],
+    ['Assigned and Resolved by Agent', c.assigned_resolved_by_agent, p.assigned_resolved_by_agent],
+    ['First reply (median)', fmtDuration(c.first_reply_median_sec), fmtDuration(p.first_reply_median_sec)],
+    ['Resolution (median)', fmtDuration(c.resolution_median_sec), fmtDuration(p.resolution_median_sec)],
+    ['CSAT average', fmtCsat(c.csat_avg), fmtCsat(p.csat_avg)],
+    ['CSAT ratings', c.csat_count, p.csat_count],
+    [],
+    ['Ticket volume'],
+    ['Period starting', 'AI only', 'AI then agent', 'Agent only'],
+    ...(d.volume ?? []).map((v: any) => [v.bucket, v.ai_only, v.ai_then_agent, v.agent_only]),
+    [],
+    ['Tickets by issue (resolved by agents)'],
+    ['Issue', 'Tickets'],
+    ...(d.by_issue ?? []).map((i: any) => [i.issue, i.count]),
+  ];
+}
 
-    const { data: agents } = await supabase
-      .from('agent_profiles')
-      .select('id, full_name');
+function agentsCsv(d: any): Cell[][] {
+  const c = d.current ?? {};
+  const p = d.previous ?? {};
+  return [
+    ['Metric', 'This period', 'Previous period'],
+    ['Active agents', c.active_agents, p.active_agents],
+    ['Tickets assigned', c.assigned, p.assigned],
+    ['Resolved tickets', c.resolved, p.resolved],
+    ['Open tickets (now)', c.open_tickets, ''],
+    [],
+    ['Agent comparison'],
+    ['Agent', 'Assigned', 'Open', 'Resolved', '1st reply (median)', 'Resolution (median)', 'CSAT', 'Ratings'],
+    ...(d.rows ?? []).map((r: any) => [
+      r.agent,
+      r.assigned,
+      r.open,
+      r.resolved,
+      fmtDuration(r.first_reply_median_sec),
+      fmtDuration(r.resolution_median_sec),
+      fmtCsat(r.csat_avg),
+      r.csat_count,
+    ]),
+  ];
+}
 
-    const agentStats: AgentPerformance[] = (agents || []).map(agent => {
-      const agentResolvedTickets = agentTickets.filter(t => (t as any).resolved_by === agent.id);
-      
-      const agentResponseTimes: number[] = [];
-      agentTickets.forEach(ticket => {
-        const ticketMessages = messages?.filter(m => m.ticket_id === ticket.id) || [];
-        for (let i = 0; i < ticketMessages.length - 1; i++) {
-          if (ticketMessages[i].sender_type === 'reseller' && ticketMessages[i + 1].sender_type === 'agent') {
-            const responseTime = (new Date(ticketMessages[i + 1].created_at).getTime() - new Date(ticketMessages[i].created_at).getTime()) / (1000 * 60);
-            agentResponseTimes.push(responseTime);
-          }
-        }
-      });
+function csatCsv(d: any): Cell[][] {
+  const c = d.current ?? {};
+  const p = d.previous ?? {};
+  return [
+    ['Metric', 'This period', 'Previous period'],
+    ['CSAT average', fmtCsat(c.csat_avg), fmtCsat(p.csat_avg)],
+    ['Ratings', c.csat_count, p.csat_count],
+    ['Rating rate (of resolved tickets)', fmtRate(c.rating_rate), fmtRate(p.rating_rate)],
+    [],
+    ['CSAT trend'],
+    ['Period starting', 'CSAT average', 'Ratings'],
+    ...(d.trend ?? []).map((t: any) => [t.bucket, fmtCsat(t.csat_avg), t.csat_count]),
+    [],
+    ['Rating distribution'],
+    ['Stars', 'Ratings'],
+    ...(d.distribution ?? []).map((x: any) => [x.stars, x.count]),
+    [],
+    ['CSAT by issue'],
+    ['Issue', 'CSAT average', 'Ratings'],
+    ...(d.by_issue ?? []).map((i: any) => [i.issue, fmtCsat(i.csat_avg), i.csat_count]),
+  ];
+}
 
-      return {
-        agentName: agent.full_name,
-        ticketsClosed: agentResolvedTickets.length,
-        avgResponseTime: agentResponseTimes.length > 0
-          ? formatDuration(agentResponseTimes.reduce((a, b) => a + b, 0) / agentResponseTimes.length)
-          : 'N/A',
-        resolvedToday: agentResolvedTickets.filter(t => new Date(t.updated_at) >= today).length,
-      };
-    }).sort((a, b) => b.ticketsClosed - a.ticketsClosed);
+// --- Small building blocks ----------------------------------------------------
 
-    setAgentPerformance(agentStats);
-  };
+function Tile({ label, value, sub, change }: { label: string; value: string; sub?: string; change?: string }) {
+  return (
+    <div className="bg-white border border-gray-200 rounded-lg p-5">
+      <p className="text-sm text-muted-foreground">{label}</p>
+      <p className="text-3xl font-bold text-foreground mt-1 tabular-nums">{value}</p>
+      {sub && <p className="text-xs text-gray-600 mt-1">{sub}</p>}
+      {change && <p className="text-xs text-muted-foreground mt-1">{change}</p>}
+    </div>
+  );
+}
 
-  const fetchVolumeTrend = (tickets: any[]) => {
-    let daysBack = 1;
-    if (volumePeriod === 'day') daysBack = 1;
-    if (volumePeriod === 'week') daysBack = 7;
-    if (volumePeriod === 'month') daysBack = 30;
+function Panel({ title, className = '', children }: { title: string; className?: string; children: ReactNode }) {
+  return (
+    <section className={`bg-white border border-gray-200 rounded-lg p-5 ${className}`}>
+      <h2 className="text-base font-semibold text-foreground mb-4">{title}</h2>
+      {children}
+    </section>
+  );
+}
 
-    const trendMap = new Map<string, number>();
-    for (let i = 0; i < daysBack; i++) {
-      const date = format(subDays(new Date(), i), 'MMM dd');
-      trendMap.set(date, 0);
-    }
+const Empty = ({ text }: { text: string }) => (
+  <p className="text-sm text-muted-foreground py-10 text-center">{text}</p>
+);
 
-    tickets.forEach(t => {
-      const createdDate = new Date(t.created_at);
-      if (createdDate >= subDays(new Date(), daysBack)) {
-        const dateKey = format(createdDate, 'MMM dd');
-        if (trendMap.has(dateKey)) {
-          trendMap.set(dateKey, (trendMap.get(dateKey) || 0) + 1);
-        }
-      }
-    });
-
-    const trendArray = Array.from(trendMap.entries())
-      .map(([date, count]) => ({ date, count }))
-      .reverse();
-
-    setVolumeTrend(trendArray);
-  };
-
-  const fetchDashboardData = async () => {
-    if (!profile) return;
-
-    setLoading(true);
-    try {
-      // Load first 1000 fast
-      const { data: firstBatch, error: firstError } = await supabase
-        .from('tickets')
-        .select('*')
-        .order('created_at', { ascending: false })
-        .range(0, 999);
-
-      if (firstError) throw firstError;
-
-      let allTickets = firstBatch || [];
-      const today = startOfDay(new Date());
-
-      // Show stats with first batch immediately
-      setCachedTickets(allTickets);
-      setStats({
-        total: allTickets.length,
-        pending: allTickets.filter((t) => t.status === 'Pending').length,
-        inProgress: allTickets.filter((t) => t.status === 'In Progress').length,
-        resolved: allTickets.filter((t) => t.status === 'Resolved').length,
-        myTickets: allTickets.filter((t) => t.assigned_agent_id === profile.id && t.status !== 'Resolved').length,
-        resolvedToday: allTickets.filter((t) => t.status === 'Resolved' && new Date(t.updated_at) >= today).length,
-      });
-
-      // Fetch messages
-      const { data: messages } = await supabase
-        .from('messages')
-        .select('ticket_id, sender_type, created_at')
-        .order('created_at', { ascending: true });
-
-      setCachedMessages(messages || []);
-
-      // Calculate metrics with first batch
-      const firstResponseTimes: number[] = [];
-      const messageResponseTimes: number[] = [];
-      
-      allTickets.forEach(ticket => {
-        const ticketMessages = messages?.filter(m => m.ticket_id === ticket.id) || [];
-        const firstAgentMessage = ticketMessages.find(m => m.sender_type === 'agent');
-        
-        if (firstAgentMessage) {
-          const responseTime = (new Date(firstAgentMessage.created_at).getTime() - new Date(ticket.created_at).getTime()) / (1000 * 60);
-          firstResponseTimes.push(responseTime);
-        }
-
-        for (let i = 0; i < ticketMessages.length - 1; i++) {
-          if (ticketMessages[i].sender_type === 'reseller' && ticketMessages[i + 1].sender_type === 'agent') {
-            const responseTime = (new Date(ticketMessages[i + 1].created_at).getTime() - new Date(ticketMessages[i].created_at).getTime()) / (1000 * 60);
-            messageResponseTimes.push(responseTime);
-          }
-        }
-      });
-
-      const resolvedTickets = allTickets.filter(t => t.status === 'Resolved');
-      const resolutionTimes = resolvedTickets.map(t => 
-        (new Date(t.updated_at).getTime() - new Date(t.created_at).getTime()) / (1000 * 60)
-      );
-
-      setResponseMetrics({
-        avgFirstResponse: firstResponseTimes.length > 0 
-          ? formatDuration(firstResponseTimes.reduce((a, b) => a + b, 0) / firstResponseTimes.length)
-          : '0m',
-        avgMessageResponse: messageResponseTimes.length > 0
-          ? formatDuration(messageResponseTimes.reduce((a, b) => a + b, 0) / messageResponseTimes.length)
-          : '0m',
-        avgResolution: resolutionTimes.length > 0
-          ? formatDuration(resolutionTimes.reduce((a, b) => a + b, 0) / resolutionTimes.length)
-          : '0m',
-      });
-
-      fetchIssueCategories(allTickets, messages || []);
-      await fetchAgentPerformance(allTickets, messages || []);
-      fetchVolumeTrend(allTickets);
-
-      const hourlyMap = new Map<number, { created: number; resolved: number }>();
-      for (let i = 0; i < 24; i++) {
-        hourlyMap.set(i, { created: 0, resolved: 0 });
-      }
-
-      allTickets.forEach(t => {
-        const createdHour = new Date(t.created_at).getHours();
-        if (new Date(t.created_at) >= today) {
-          const data = hourlyMap.get(createdHour)!;
-          data.created++;
-          hourlyMap.set(createdHour, data);
-        }
-
-        if (t.status === 'Resolved' && new Date(t.updated_at) >= today) {
-          const resolvedHour = new Date(t.updated_at).getHours();
-          const data = hourlyMap.get(resolvedHour)!;
-          data.resolved++;
-          hourlyMap.set(resolvedHour, data);
-        }
-      });
-
-      const hourlyArray: HourlyData[] = Array.from(hourlyMap.entries()).map(([hour, data]) => ({
-        hour: `${hour.toString().padStart(2, '0')}:00`,
-        created: data.created,
-        resolved: data.resolved,
-      }));
-
-      setHourlyData(hourlyArray);
-
-      // Load rest in background
-      let from = 1000;
-      const pageSize = 1000;
-
-      while (true) {
-        const { data, error } = await supabase
-          .from('tickets')
-          .select('*')
-          .order('created_at', { ascending: false })
-          .range(from, from + pageSize - 1);
-
-        if (error || !data || data.length === 0) break;
-        
-        allTickets = [...allTickets, ...data];
-        
-        // Update stats progressively
-        setCachedTickets(allTickets);
-        setStats({
-          total: allTickets.length,
-          pending: allTickets.filter((t) => t.status === 'Pending').length,
-          inProgress: allTickets.filter((t) => t.status === 'In Progress').length,
-          resolved: allTickets.filter((t) => t.status === 'Resolved').length,
-          myTickets: allTickets.filter((t) => t.assigned_agent_id === profile.id && t.status !== 'Resolved').length,
-          resolvedToday: allTickets.filter((t) => t.status === 'Resolved' && new Date(t.updated_at) >= today).length,
-        });
-        
-        if (data.length < pageSize) break;
-        from += pageSize;
-      }
-
-    } catch (error) {
-      console.error('Error fetching dashboard data:', error);
-      toast.error('Failed to load dashboard data');
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  if (loading) {
+function QueryState({ query, children }: { query: UseQueryResult<any>; children: (data: any) => ReactNode }) {
+  if (query.isPending) {
     return (
-      <div className="flex items-center justify-center min-h-screen">
-        <Loader2 className="h-8 w-8 animate-spin text-primary" />
+      <div className="flex justify-center py-16">
+        <Loader2 className="h-6 w-6 animate-spin text-primary" />
       </div>
     );
   }
+  if (query.isError) {
+    const denied = String((query.error as any)?.message ?? '').includes('not_authorized');
+    return (
+      <div className="bg-white border border-gray-200 rounded-lg p-8 text-center space-y-3">
+        <p className="text-sm text-gray-700">
+          {denied
+            ? 'This account does not have access to the dashboard.'
+            : 'Dashboard data could not be loaded. Check your connection and try again.'}
+        </p>
+        {!denied && (
+          <Button variant="outline" size="sm" onClick={() => query.refetch()}>
+            Try again
+          </Button>
+        )}
+      </div>
+    );
+  }
+  return <>{children(query.data)}</>;
+}
+
+// --- Tabs -------------------------------------------------------------------------
+
+function OverviewTab({ data }: { data: any }) {
+  const c = data.current ?? {};
+  const p = data.previous ?? {};
+  const total = Number(c.total ?? 0);
+  const share = (n: number | null | undefined) =>
+    n == null || total === 0 ? undefined : `${Math.round((Number(n) / total) * 100)}% of tickets`;
+
+  const volume = (data.volume ?? []).map((v: any) => ({ ...v, label: bucketLabel(v.bucket, data.bucket) }));
+  const issues = data.by_issue ?? [];
+  const issueTotal = issues.reduce((s: number, i: any) => s + Number(i.count), 0);
+
+  return (
+    <div className="space-y-4">
+      <div className="grid grid-cols-2 lg:grid-cols-3 xl:grid-cols-6 gap-4">
+        <Tile label="Total tickets" value={fmtInt(total)} change={changeText(c.total, p.total)} />
+        <Tile
+          label="Handled by AI"
+          value={c.handled_by_ai == null ? '—' : fmtInt(c.handled_by_ai)}
+          sub={share(c.handled_by_ai)}
+          change={changeText(c.handled_by_ai, p.handled_by_ai)}
+        />
+        <Tile
+          label="Assigned and Resolved by Agent"
+          value={fmtInt(c.assigned_resolved_by_agent)}
+          sub={share(c.assigned_resolved_by_agent)}
+          change={changeText(c.assigned_resolved_by_agent, p.assigned_resolved_by_agent)}
+        />
+        <Tile
+          label="First reply"
+          value={fmtDuration(c.first_reply_median_sec)}
+          change={changeText(c.first_reply_median_sec, p.first_reply_median_sec)}
+        />
+        <Tile
+          label="Resolution"
+          value={fmtDuration(c.resolution_median_sec)}
+          change={changeText(c.resolution_median_sec, p.resolution_median_sec)}
+        />
+        <Tile
+          label="CSAT average"
+          value={fmtCsat(c.csat_avg)}
+          sub={c.csat_count ? `from ${fmtInt(c.csat_count)} ${Number(c.csat_count) === 1 ? 'rating' : 'ratings'}` : 'No ratings yet'}
+          change={changeText(c.csat_avg, p.csat_avg, 'abs')}
+        />
+      </div>
+
+      <p className="text-xs text-muted-foreground">{BOTH_COUNTS_NOTE}</p>
+
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+        <Panel title="Ticket volume" className="lg:col-span-2">
+          {total === 0 ? (
+            <Empty text="No tickets in this period." />
+          ) : (
+            <div className="h-72">
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart data={volume} margin={{ top: 8, right: 8, left: -16, bottom: 0 }}>
+                  <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e5e7eb" />
+                  <XAxis dataKey="label" tick={{ fontSize: 12 }} tickLine={false} axisLine={false} />
+                  <YAxis allowDecimals={false} tick={{ fontSize: 12 }} tickLine={false} axisLine={false} />
+                  <Tooltip cursor={{ fill: '#f3f4f6' }} />
+                  <Legend wrapperStyle={{ fontSize: 12 }} />
+                  <Bar dataKey="ai_only" name="AI only" stackId="v" fill={COLORS.aiOnly} />
+                  <Bar dataKey="ai_then_agent" name="AI then agent" stackId="v" fill={COLORS.aiThenAgent} />
+                  <Bar dataKey="agent_only" name="Agent only" stackId="v" fill={COLORS.agentOnly} radius={[3, 3, 0, 0]} />
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
+          )}
+        </Panel>
+
+        <Panel title="Tickets by issue">
+          {issues.length === 0 ? (
+            <Empty text="No tickets resolved by agents in this period." />
+          ) : (
+            <ul className="space-y-3">
+              {issues.map((i: any) => {
+                const pct = issueTotal ? Math.round((Number(i.count) / issueTotal) * 100) : 0;
+                return (
+                  <li key={i.issue}>
+                    <div className="flex justify-between gap-2 text-sm">
+                      <span className="text-gray-900">{i.issue}</span>
+                      <span className="tabular-nums text-gray-700">
+                        {fmtInt(i.count)} <span className="text-muted-foreground">({pct}%)</span>
+                      </span>
+                    </div>
+                    <div className="mt-1 h-1.5 rounded bg-gray-100">
+                      <div className="h-1.5 rounded" style={{ width: `${pct}%`, backgroundColor: COLORS.agentOnly }} />
+                    </div>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+        </Panel>
+      </div>
+    </div>
+  );
+}
+
+function AgentsTab({ data }: { data: any }) {
+  const c = data.current ?? {};
+  const p = data.previous ?? {};
+  const rows = data.rows ?? [];
+
+  return (
+    <div className="space-y-4">
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+        <Tile label="Active agents" value={fmtInt(c.active_agents)} change={changeText(c.active_agents, p.active_agents)} />
+        <Tile label="Tickets assigned" value={fmtInt(c.assigned)} change={changeText(c.assigned, p.assigned)} />
+        <Tile label="Resolved tickets" value={fmtInt(c.resolved)} change={changeText(c.resolved, p.resolved)} />
+        <Tile label="Open tickets" value={fmtInt(c.open_tickets)} sub="Right now" />
+      </div>
+
+      <Panel title="Agent comparison">
+        {rows.length === 0 ? (
+          <Empty text="No tickets were assigned to agents in this period." />
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="border-b text-gray-600">
+                  <th className="py-2.5 px-3 text-left font-medium">Agent</th>
+                  <th className="py-2.5 px-3 text-right font-medium">Assigned</th>
+                  <th className="py-2.5 px-3 text-right font-medium">Open</th>
+                  <th className="py-2.5 px-3 text-right font-medium">Resolved</th>
+                  <th className="py-2.5 px-3 text-right font-medium">1st reply</th>
+                  <th className="py-2.5 px-3 text-right font-medium">Resolution</th>
+                  <th className="py-2.5 px-3 text-right font-medium">CSAT</th>
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map((r: any) => (
+                  <tr key={r.agent_id} className="border-b last:border-b-0">
+                    <td className="py-2.5 px-3 text-gray-900">{r.agent}</td>
+                    <td className="py-2.5 px-3 text-right tabular-nums">{fmtInt(r.assigned)}</td>
+                    <td className="py-2.5 px-3 text-right tabular-nums">{fmtInt(r.open)}</td>
+                    <td className="py-2.5 px-3 text-right tabular-nums">{fmtInt(r.resolved)}</td>
+                    <td className="py-2.5 px-3 text-right tabular-nums">{fmtDuration(r.first_reply_median_sec)}</td>
+                    <td className="py-2.5 px-3 text-right tabular-nums">{fmtDuration(r.resolution_median_sec)}</td>
+                    <td className="py-2.5 px-3 text-right tabular-nums">
+                      {r.csat_count ? `${fmtCsat(r.csat_avg)} (${r.csat_count})` : '—'}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </Panel>
+    </div>
+  );
+}
+
+function CsatTab({ data }: { data: any }) {
+  const c = data.current ?? {};
+  const p = data.previous ?? {};
+  const trend = (data.trend ?? []).map((t: any) => ({
+    ...t,
+    label: bucketLabel(t.bucket, data.bucket),
+    csat_avg: t.csat_count ? Number(t.csat_avg) : null,
+  }));
+  const dist = data.distribution ?? [];
+  const totalRatings = dist.reduce((s: number, x: any) => s + Number(x.count), 0);
+  const byIssue = data.by_issue ?? [];
+
+  return (
+    <div className="space-y-4">
+      <div className="grid grid-cols-2 gap-4 lg:max-w-xl">
+        <Tile
+          label="CSAT average"
+          value={fmtCsat(c.csat_avg)}
+          sub={c.csat_count ? `from ${fmtInt(c.csat_count)} ${Number(c.csat_count) === 1 ? 'rating' : 'ratings'}` : 'No ratings yet'}
+          change={changeText(c.csat_avg, p.csat_avg, 'abs')}
+        />
+        <Tile
+          label="Rating rate"
+          value={fmtRate(c.rating_rate)}
+          sub="of resolved tickets"
+          change={changeText(c.rating_rate, p.rating_rate, 'pts')}
+        />
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+        <Panel title="CSAT trend" className="lg:col-span-2">
+          {!c.csat_count ? (
+            <Empty text="No ratings in this period." />
+          ) : (
+            <div className="h-64">
+              <ResponsiveContainer width="100%" height="100%">
+                <LineChart data={trend} margin={{ top: 8, right: 8, left: -16, bottom: 0 }}>
+                  <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e5e7eb" />
+                  <XAxis dataKey="label" tick={{ fontSize: 12 }} tickLine={false} axisLine={false} />
+                  <YAxis domain={[1, 5]} ticks={[1, 2, 3, 4, 5]} tick={{ fontSize: 12 }} tickLine={false} axisLine={false} />
+                  <Tooltip formatter={(v: any) => [fmtCsat(v), 'CSAT']} />
+                  <Line type="monotone" dataKey="csat_avg" stroke={COLORS.aiOnly} strokeWidth={2} connectNulls dot={{ r: 3 }} />
+                </LineChart>
+              </ResponsiveContainer>
+            </div>
+          )}
+        </Panel>
+
+        <Panel title="Rating distribution">
+          {totalRatings === 0 ? (
+            <Empty text="No ratings in this period." />
+          ) : (
+            <ul className="space-y-3">
+              {dist.map((x: any) => {
+                const pct = Math.round((Number(x.count) / totalRatings) * 100);
+                return (
+                  <li key={x.stars} className="flex items-center gap-3 text-sm">
+                    <span className="flex items-center gap-1 w-8 tabular-nums text-gray-900">
+                      {x.stars}
+                      <Star className="h-3.5 w-3.5" style={{ color: COLORS.star, fill: COLORS.star }} />
+                    </span>
+                    <div className="flex-1 h-2 rounded bg-gray-100">
+                      <div className="h-2 rounded" style={{ width: `${pct}%`, backgroundColor: COLORS.star }} />
+                    </div>
+                    <span className="w-20 text-right tabular-nums text-gray-700">
+                      {fmtInt(x.count)} <span className="text-muted-foreground">({pct}%)</span>
+                    </span>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+        </Panel>
+      </div>
+
+      <Panel title="CSAT by issue">
+        {byIssue.length === 0 ? (
+          <Empty text="No ratings in this period." />
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="border-b text-gray-600">
+                  <th className="py-2.5 px-3 text-left font-medium">Issue</th>
+                  <th className="py-2.5 px-3 text-right font-medium">CSAT</th>
+                  <th className="py-2.5 px-3 text-right font-medium">Ratings</th>
+                </tr>
+              </thead>
+              <tbody>
+                {byIssue.map((i: any) => (
+                  <tr key={i.issue} className="border-b last:border-b-0">
+                    <td className="py-2.5 px-3 text-gray-900">{i.issue}</td>
+                    <td className="py-2.5 px-3 text-right tabular-nums">{fmtCsat(i.csat_avg)}</td>
+                    <td className="py-2.5 px-3 text-right tabular-nums">{fmtInt(i.csat_count)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </Panel>
+    </div>
+  );
+}
+
+// --- Page -------------------------------------------------------------------------
+
+const Dashboard = () => {
+  const navigate = useNavigate();
+  const [tab, setTab] = useState<TabKey>('overview');
+  const [rangeKey, setRangeKey] = useState<RangeKey>('7d');
+  const [custom, setCustom] = useState<DateRange | undefined>();
+  const [agent, setAgent] = useState('all');
+  const [issue, setIssue] = useState('all');
+
+  const range = useMemo(() => getRange(rangeKey, custom), [rangeKey, custom]);
+  const p_from = range.from.toISOString();
+  const p_to = range.to.toISOString();
+  const p_agent = agent === 'all' ? null : agent;
+  const p_issue = issue === 'all' ? null : issue;
+
+  const options = useQuery({
+    queryKey: ['dash-options'],
+    queryFn: () => callRpc('dashboard_filter_options'),
+    staleTime: 5 * 60_000,
+  });
+
+  const overview = useQuery({
+    queryKey: ['dash-overview', p_from, p_to, p_agent, p_issue],
+    queryFn: () => callRpc('dashboard_overview', { p_from, p_to, p_agent, p_issue }),
+    enabled: tab === 'overview',
+    staleTime: 60_000,
+  });
+
+  const agents = useQuery({
+    queryKey: ['dash-agents', p_from, p_to, p_issue],
+    queryFn: () => callRpc('dashboard_agents', { p_from, p_to, p_issue }),
+    enabled: tab === 'agents',
+    staleTime: 60_000,
+  });
+
+  const csat = useQuery({
+    queryKey: ['dash-csat', p_from, p_to, p_agent, p_issue],
+    queryFn: () => callRpc('dashboard_csat', { p_from, p_to, p_agent, p_issue }),
+    enabled: tab === 'csat',
+    staleTime: 60_000,
+  });
+
+  const agentOptions: { id: string; name: string }[] = options.data?.agents ?? [];
+  const issueOptions: string[] = options.data?.issues ?? [];
+
+  const rangeLabel =
+    rangeKey === 'custom'
+      ? `${format(range.from, 'MMM d, yyyy')} – ${format(subDays(range.to, 1), 'MMM d, yyyy')}`
+      : RANGE_OPTIONS.find((o) => o.value === rangeKey)?.label ?? '';
+  const agentLabel = agent === 'all' ? 'All agents' : agentOptions.find((a) => a.id === agent)?.name ?? 'Selected agent';
+  const issueLabel = issue === 'all' ? 'All issues' : issue;
+
+  const activeQuery = tab === 'overview' ? overview : tab === 'agents' ? agents : csat;
+
+  const handleExport = () => {
+    const data = activeQuery.data;
+    if (!data) return;
+    const meta: Cell[][] = [
+      ['Support Analytics', TAB_LABELS[tab]],
+      ['Date range', rangeLabel],
+      ...(tab === 'agents' ? [] : [['Agent', agentLabel] as Cell[]]),
+      ['Issue', issueLabel],
+      [],
+    ];
+    const body = tab === 'overview' ? overviewCsv(data) : tab === 'agents' ? agentsCsv(data) : csatCsv(data);
+    downloadCsv(`support-analytics-${tab}-${format(new Date(), 'yyyy-MM-dd')}.csv`, [...meta, ...body]);
+  };
 
   return (
     <div className="flex flex-col min-h-screen bg-background">
       <div className="sticky top-0 bg-white border-b p-4 z-10">
         <div className="flex items-center gap-4">
-          <Button variant="ghost" size="icon" onClick={() => navigate('/tickets')}>
+          <Button variant="ghost" size="icon" onClick={() => navigate('/tickets')} aria-label="Back to tickets">
             <ArrowLeft className="h-5 w-5" />
           </Button>
           <div>
             <h1 className="text-2xl font-bold text-foreground">Dashboard</h1>
-            <p className="text-sm text-muted-foreground">Overview of ticket metrics</p>
+            <p className="text-sm text-muted-foreground">Support analytics</p>
           </div>
         </div>
       </div>
 
       <div className="flex-1 p-6 overflow-y-auto">
-        <div className="max-w-7xl mx-auto space-y-6">
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-            <div className="bg-white border border-gray-200 rounded-lg p-6">
-              <div className="flex items-center justify-between">
-                <div>
-                  <p className="text-sm text-muted-foreground">Total Tickets</p>
-                  <p className="text-3xl font-bold text-foreground mt-1">{stats.total}</p>
-                </div>
-                <div className="h-12 w-12 bg-blue-100 rounded-full flex items-center justify-center">
-                  <BarChart3 className="h-6 w-6 text-blue-600" />
-                </div>
-              </div>
-            </div>
+        <div className="max-w-7xl mx-auto space-y-4">
+          <Tabs value={tab} onValueChange={(v) => setTab(v as TabKey)}>
+            {/* Filters (kept when switching tabs) */}
+            <div className="flex flex-wrap items-center gap-2 mb-4">
+              <Select value={rangeKey} onValueChange={(v) => { if (v === 'custom' && !custom?.from) setCustom({ from: range.from, to: subDays(range.to, 1) }); setRangeKey(v as RangeKey); }}>
+                <SelectTrigger className="w-40 h-9 bg-white">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {RANGE_OPTIONS.map((o) => (
+                    <SelectItem key={o.value} value={o.value}>
+                      {o.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
 
-            <div className="bg-white border border-gray-200 rounded-lg p-6">
-              <div className="flex items-center justify-between">
-                <div>
-                  <p className="text-sm text-muted-foreground">Pending</p>
-                  <p className="text-3xl font-bold text-amber-600 mt-1">{stats.pending}</p>
-                </div>
-                <div className="h-12 w-12 bg-amber-100 rounded-full flex items-center justify-center">
-                  <Clock className="h-6 w-6 text-amber-600" />
-                </div>
-              </div>
-            </div>
-
-            <div className="bg-white border border-gray-200 rounded-lg p-6">
-              <div className="flex items-center justify-between">
-                <div>
-                  <p className="text-sm text-muted-foreground">In Progress</p>
-                  <p className="text-3xl font-bold text-blue-600 mt-1">{stats.inProgress}</p>
-                </div>
-                <div className="h-12 w-12 bg-blue-100 rounded-full flex items-center justify-center">
-                  <AlertCircle className="h-6 w-6 text-blue-600" />
-                </div>
-              </div>
-            </div>
-
-            <div className="bg-white border border-gray-200 rounded-lg p-6">
-              <div className="flex items-center justify-between">
-                <div>
-                  <p className="text-sm text-muted-foreground">Resolved</p>
-                  <p className="text-3xl font-bold text-green-600 mt-1">{stats.resolved}</p>
-                </div>
-                <div className="h-12 w-12 bg-green-100 rounded-full flex items-center justify-center">
-                  <CheckCircle className="h-6 w-6 text-green-600" />
-                </div>
-              </div>
-            </div>
-
-            <div className="bg-white border border-gray-200 rounded-lg p-6">
-              <div className="flex items-center justify-between">
-                <div>
-                  <p className="text-sm text-muted-foreground">My Tickets</p>
-                  <p className="text-3xl font-bold text-purple-600 mt-1">{stats.myTickets}</p>
-                </div>
-                <div className="h-12 w-12 bg-purple-100 rounded-full flex items-center justify-center">
-                  <User className="h-6 w-6 text-purple-600" />
-                </div>
-              </div>
-            </div>
-
-            <div className="bg-white border border-gray-200 rounded-lg p-6">
-              <div className="flex items-center justify-between">
-                <div>
-                  <p className="text-sm text-muted-foreground">Resolved Today</p>
-                  <p className="text-3xl font-bold text-green-600 mt-1">{stats.resolvedToday}</p>
-                </div>
-                <div className="h-12 w-12 bg-green-100 rounded-full flex items-center justify-center">
-                  <CheckCircle className="h-6 w-6 text-green-600" />
-                </div>
-              </div>
-            </div>
-          </div>
-
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-            <div className="bg-white border border-gray-200 rounded-lg p-6">
-              <p className="text-sm text-muted-foreground mb-2">Avg First Response</p>
-              <p className="text-2xl font-bold text-foreground">{responseMetrics.avgFirstResponse}</p>
-            </div>
-            <div className="bg-white border border-gray-200 rounded-lg p-6">
-              <p className="text-sm text-muted-foreground mb-2">Avg Message Response</p>
-              <p className="text-2xl font-bold text-foreground">{responseMetrics.avgMessageResponse}</p>
-            </div>
-            <div className="bg-white border border-gray-200 rounded-lg p-6">
-              <p className="text-sm text-muted-foreground mb-2">Avg Resolution Time</p>
-              <p className="text-2xl font-bold text-foreground">{responseMetrics.avgResolution}</p>
-            </div>
-          </div>
-
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-            <div className="bg-white border border-gray-200 rounded-lg p-6">
-              <h2 className="text-lg font-semibold text-foreground mb-4">Today's Activity</h2>
-              <div className="h-64 flex items-end gap-2">
-                {hourlyData.filter(h => h.created > 0 || h.resolved > 0).map((data, idx) => {
-                  const maxValue = Math.max(...hourlyData.map(h => Math.max(h.created, h.resolved)));
-                  const totalHeight = 200;
-                  const createdHeight = (data.created / maxValue) * totalHeight;
-                  const resolvedHeight = (data.resolved / maxValue) * totalHeight;
-                  
-                  return (
-                    <div key={idx} className="flex-1 flex flex-col items-center gap-1">
-                      <div className="relative w-full flex flex-col items-center" style={{ height: '200px' }}>
-                        <div className="absolute bottom-0 w-full flex flex-col">
-                          <div
-                            className="bg-blue-500 w-full flex items-center justify-center text-white text-[10px] font-bold"
-                            style={{ height: `${createdHeight}px`, minHeight: data.created > 0 ? '16px' : '0' }}
-                          >
-                            {data.created > 0 && data.created}
-                          </div>
-                          <div
-                            className="bg-green-500 w-full flex items-center justify-center text-white text-[10px] font-bold"
-                            style={{ height: `${resolvedHeight}px`, minHeight: data.resolved > 0 ? '16px' : '0' }}
-                          >
-                            {data.resolved > 0 && data.resolved}
-                          </div>
-                        </div>
-                      </div>
-                      <span className="text-[10px] text-gray-600">{data.hour}</span>
-                    </div>
-                  );
-                })}
-              </div>
-              <div className="flex justify-center gap-6 mt-4">
-                <div className="flex items-center gap-2">
-                  <div className="w-4 h-4 bg-blue-500 rounded" />
-                  <span className="text-sm text-gray-700">Created</span>
-                </div>
-                <div className="flex items-center gap-2">
-                  <div className="w-4 h-4 bg-green-500 rounded" />
-                  <span className="text-sm text-gray-700">Resolved</span>
-                </div>
-              </div>
-            </div>
-
-            <div className="bg-white border border-gray-200 rounded-lg p-6">
-              <div className="flex items-center justify-between mb-4">
-                <h2 className="text-lg font-semibold text-foreground">Ticket Volume Trend</h2>
-                <Select value={volumePeriod} onValueChange={(val: any) => setVolumePeriod(val)}>
-                  <SelectTrigger className="w-32">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="day">Today</SelectItem>
-                    <SelectItem value="week">Last 7 Days</SelectItem>
-                    <SelectItem value="month">Last 30 Days</SelectItem>
-                  </SelectContent>
-                </Select>
-              </div>
-              <div className="h-64 flex items-end gap-1">
-                {volumeTrend.map((data, idx) => (
-                  <div key={idx} className="flex-1 flex flex-col items-center gap-1">
-                    <div
-                      className="bg-purple-500 w-full rounded-t"
-                      style={{ 
-                        height: `${(data.count / Math.max(...volumeTrend.map(v => v.count))) * 200}px`,
-                        minHeight: data.count > 0 ? '4px' : '0'
-                      }}
-                      title={`${data.date}: ${data.count} tickets`}
+              {rangeKey === 'custom' && (
+                <Popover>
+                  <PopoverTrigger asChild>
+                    <Button variant="outline" className="h-9 gap-2 font-normal bg-white">
+                      <CalendarIcon className="h-4 w-4" />
+                      {custom?.from
+                        ? `${format(custom.from, 'MMM d')} – ${format(custom.to ?? custom.from, 'MMM d, yyyy')}`
+                        : 'Pick dates'}
+                    </Button>
+                  </PopoverTrigger>
+                  <PopoverContent className="w-auto p-0" align="start">
+                    <Calendar
+                      mode="range"
+                      selected={custom}
+                      onSelect={setCustom}
+                      numberOfMonths={2}
+                      disabled={{ after: new Date() }}
+                      initialFocus
                     />
-                    <span className="text-[10px] text-gray-600 transform -rotate-45 origin-top-left mt-4">{data.date}</span>
-                  </div>
-                ))}
-              </div>
-            </div>
-          </div>
+                  </PopoverContent>
+                </Popover>
+              )}
 
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-            <div className="bg-white border border-gray-200 rounded-lg p-6">
-              <div className="flex items-center justify-between mb-4">
-                <h2 className="text-lg font-semibold text-foreground">Issue Categories</h2>
-                <Select value={issueCategoryPeriod} onValueChange={(val: any) => setIssueCategoryPeriod(val)}>
-                  <SelectTrigger className="w-32">
+              {tab !== 'agents' && (
+                <Select value={agent} onValueChange={setAgent}>
+                  <SelectTrigger className="w-44 h-9 bg-white">
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="1h">Last Hour</SelectItem>
-                    <SelectItem value="1d">Today</SelectItem>
-                    <SelectItem value="1w">Last 7 Days</SelectItem>
-                    <SelectItem value="1m">Last 30 Days</SelectItem>
+                    <SelectItem value="all">All agents</SelectItem>
+                    {agentOptions.map((a) => (
+                      <SelectItem key={a.id} value={a.id}>
+                        {a.name}
+                      </SelectItem>
+                    ))}
                   </SelectContent>
                 </Select>
-              </div>
-              <div className="overflow-x-auto">
-                <table className="w-full">
-                  <thead>
-                    <tr className="border-b">
-                      <th className="text-left py-3 px-4 text-sm font-medium text-gray-600">Issue Type</th>
-                      <th className="text-right py-3 px-4 text-sm font-medium text-gray-600">Count</th>
-                      <th className="text-right py-3 px-4 text-sm font-medium text-gray-600">Avg Resolution</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {issueCategories.map((cat, idx) => (
-                      <tr key={idx} className="border-b last:border-b-0">
-                        <td className="py-3 px-4 text-sm text-gray-900">{cat.issueType}</td>
-                        <td className="py-3 px-4 text-sm text-right font-semibold text-gray-900">{cat.count}</td>
-                        <td className="py-3 px-4 text-sm text-right text-gray-700">{cat.avgResolutionTime}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
+              )}
+
+              <Select value={issue} onValueChange={setIssue}>
+                <SelectTrigger className="w-44 h-9 bg-white">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">All issues</SelectItem>
+                  {issueOptions.map((i) => (
+                    <SelectItem key={i} value={i}>
+                      {i}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+
+              <Button
+                variant="outline"
+                className="h-9 gap-2 bg-white ml-auto"
+                onClick={handleExport}
+                disabled={!activeQuery.data}
+              >
+                <Download className="h-4 w-4" />
+                Export
+              </Button>
             </div>
 
-            <div className="bg-white border border-gray-200 rounded-lg p-6">
-              <div className="flex items-center justify-between mb-4">
-                <h2 className="text-lg font-semibold text-foreground">Agent Performance</h2>
-                <Select value={agentPeriod} onValueChange={(val: any) => setAgentPeriod(val)}>
-                  <SelectTrigger className="w-32">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="1h">Last Hour</SelectItem>
-                    <SelectItem value="1d">Today</SelectItem>
-                    <SelectItem value="1w">Last 7 Days</SelectItem>
-                    <SelectItem value="1m">Last 30 Days</SelectItem>
-                  </SelectContent>
-                </Select>
-              </div>
-              <div className="overflow-x-auto">
-                <table className="w-full">
-                  <thead>
-                    <tr className="border-b">
-                      <th className="text-left py-3 px-4 text-sm font-medium text-gray-600">Agent</th>
-                      <th className="text-right py-3 px-4 text-sm font-medium text-gray-600">Closed</th>
-                      <th className="text-right py-3 px-4 text-sm font-medium text-gray-600">Avg Response</th>
-                      <th className="text-right py-3 px-4 text-sm font-medium text-gray-600">Today</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {agentPerformance.map((agent, idx) => (
-                      <tr key={idx} className="border-b last:border-b-0">
-                        <td className="py-3 px-4 text-sm text-gray-900">{agent.agentName}</td>
-                        <td className="py-3 px-4 text-sm text-right font-semibold text-gray-900">{agent.ticketsClosed}</td>
-                        <td className="py-3 px-4 text-sm text-right text-gray-700">{agent.avgResponseTime}</td>
-                        <td className="py-3 px-4 text-sm text-right text-green-600 font-semibold">{agent.resolvedToday}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          </div>
+            <TabsList>
+              <TabsTrigger value="overview">Overview</TabsTrigger>
+              <TabsTrigger value="agents">Agents</TabsTrigger>
+              <TabsTrigger value="csat">CSAT</TabsTrigger>
+            </TabsList>
+
+            <TabsContent value="overview" className="mt-4">
+              <QueryState query={overview}>{(d) => <OverviewTab data={d} />}</QueryState>
+            </TabsContent>
+            <TabsContent value="agents" className="mt-4">
+              <QueryState query={agents}>{(d) => <AgentsTab data={d} />}</QueryState>
+            </TabsContent>
+            <TabsContent value="csat" className="mt-4">
+              <QueryState query={csat}>{(d) => <CsatTab data={d} />}</QueryState>
+            </TabsContent>
+          </Tabs>
         </div>
       </div>
     </div>

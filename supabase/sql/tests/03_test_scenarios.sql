@@ -2,7 +2,7 @@
 -- 03_test_scenarios.sql
 -- TEST PROJECT ONLY (markaz-helpline-test). DO NOT RUN ON PRODUCTION.
 --
--- Creates 6 NEW (post-launch) sample tickets, runs every CSAT and
+-- Creates 8 NEW (post-launch) sample tickets, runs every CSAT and
 -- tracking rule against them and against the OLD tickets, and shows one
 -- PASS/FAIL row per check. Safe to run again: it cleans up its own data.
 -- =====================================================================
@@ -17,10 +17,12 @@ drop table if exists test_results;
 create temp table test_results (n serial, test text, expected text, actual text);
 
 -- ---------------------------------------------------------------------
--- 1. Six new tickets (created now, i.e. after launch)
+-- 1. Eight new tickets (created now, i.e. after launch)
 --    N1 AI only, closed by customer   N2 AI then agent (Sana)
 --    N3 agent only (Ahmed)            N4 still open (Ayesha)
 --    N5 window will expire (Sana)     N6 reopened before rating (Ahmed)
+--    N7 never assigned, Ayesha replies and resolves it
+--    N8 no reply from anyone yet
 -- ---------------------------------------------------------------------
 insert into public.tickets
   (id, reseller_id, reseller_name, reseller_phone, order_id, issue_type, description, status, ticket_source, ai_handled)
@@ -30,7 +32,9 @@ values
   ('cccccccc-0000-0000-0000-000000000003', 'aaaaaaaa-0000-0000-0000-000000000103', 'New Reseller 3', '03100000003', 'ORD-2003', 'Payment Issues',  'Payment missing.',         'Pending', 'manual', false),
   ('cccccccc-0000-0000-0000-000000000004', 'aaaaaaaa-0000-0000-0000-000000000104', 'New Reseller 4', '03100000004', 'ORD-2004', 'App/OTP',         'Cannot log in.',           'Pending', 'manual', false),
   ('cccccccc-0000-0000-0000-000000000005', 'aaaaaaaa-0000-0000-0000-000000000105', 'New Reseller 5', '03100000005', 'ORD-2005', 'Return Issues',   'Return not picked up.',    'Pending', 'auto',   false),
-  ('cccccccc-0000-0000-0000-000000000006', 'aaaaaaaa-0000-0000-0000-000000000106', 'New Reseller 6', '03100000006', 'ORD-2006', 'Other',           'General question.',        'Pending', 'manual', false);
+  ('cccccccc-0000-0000-0000-000000000006', 'aaaaaaaa-0000-0000-0000-000000000106', 'New Reseller 6', '03100000006', 'ORD-2006', 'Other',           'General question.',        'Pending', 'manual', false),
+  ('cccccccc-0000-0000-0000-000000000007', 'aaaaaaaa-0000-0000-0000-000000000107', 'New Reseller 7', '03100000007', 'ORD-2007', 'Payment Issues',  'Refund not received.',     'Pending', 'manual', false),
+  ('cccccccc-0000-0000-0000-000000000008', 'aaaaaaaa-0000-0000-0000-000000000108', 'New Reseller 8', '03100000008', 'ORD-2008', 'Other',           'Still waiting.',           'Pending', 'manual', false);
 
 -- ---------------------------------------------------------------------
 -- 2. Messages (description message at +0 is added by the existing trigger)
@@ -50,7 +54,9 @@ insert into public.messages (ticket_id, sender_type, sender_name, message, creat
   -- N4, N5, N6: one agent reply each
   ('cccccccc-0000-0000-0000-000000000004', 'agent',    'Ayesha',         'Please update the app.',    now() + interval '10 minutes'),
   ('cccccccc-0000-0000-0000-000000000005', 'agent',    'Sana',           'Pickup rescheduled.',       now() + interval '15 minutes'),
-  ('cccccccc-0000-0000-0000-000000000006', 'agent',    'Ahmed',          'Here is the answer.',       now() + interval '10 minutes');
+  ('cccccccc-0000-0000-0000-000000000006', 'agent',    'Ahmed',          'Here is the answer.',       now() + interval '10 minutes'),
+  -- N7: Ayesha replies without being assigned. N8: no reply at all.
+  ('cccccccc-0000-0000-0000-000000000007', 'agent',    'Ayesha',         'Refund is on its way.',     now() + interval '15 minutes');
 
 -- A new message on an OLD ticket: must still not be tracked
 insert into public.messages (id, ticket_id, sender_type, sender_name, message)
@@ -69,6 +75,9 @@ update public.tickets set status = 'Resolved', closed_by = 'reseller' where id =
 update public.tickets set status = 'Resolved', resolved_by = assigned_agent_id
  where id in ('cccccccc-0000-0000-0000-000000000002', 'cccccccc-0000-0000-0000-000000000003',
               'cccccccc-0000-0000-0000-000000000005', 'cccccccc-0000-0000-0000-000000000006');
+-- N7 resolved by Ayesha without ever being assigned
+update public.tickets set status = 'Resolved', resolved_by = '33333333-3333-3333-3333-333333333333'
+ where id = 'cccccccc-0000-0000-0000-000000000007';
 
 -- ---------------------------------------------------------------------
 -- 4. Tracking checks
@@ -76,7 +85,7 @@ update public.tickets set status = 'Resolved', resolved_by = assigned_agent_id
 insert into test_results (test, expected, actual) values
   ('Old tickets are not tracked (incl. new message on old ticket)', '0',
      (select count(*)::text from public.ticket_metrics where ticket_id::text like 'bbbbbbbb-%')),
-  ('All 6 new tickets are tracked', '6',
+  ('All 8 new tickets are tracked', '8',
      (select count(*)::text from public.ticket_metrics where ticket_id::text like 'cccccccc-%')),
   ('N1 Handled by AI', 'true',
      (select (first_ai_msg_at is not null)::text from public.ticket_metrics where ticket_id = 'cccccccc-0000-0000-0000-000000000001')),
@@ -93,7 +102,11 @@ insert into test_results (test, expected, actual) values
   ('N3 not Handled by AI', 'false',
      (select (first_ai_msg_at is not null)::text from public.ticket_metrics where ticket_id = 'cccccccc-0000-0000-0000-000000000003')),
   ('N4 open ticket has no resolve time', 'true',
-     (select (resolved_at is null)::text from public.ticket_metrics where ticket_id = 'cccccccc-0000-0000-0000-000000000004'));
+     (select (resolved_at is null)::text from public.ticket_metrics where ticket_id = 'cccccccc-0000-0000-0000-000000000004')),
+  ('N7 unassigned, resolved by Ayesha: rating goes to Ayesha', '33333333-3333-3333-3333-333333333333',
+     (select resolved_agent_id::text from public.ticket_metrics where ticket_id = 'cccccccc-0000-0000-0000-000000000007')),
+  ('N8 no reply: neither AI nor human', 'false',
+     (select (first_ai_msg_at is not null or first_agent_msg_at is not null)::text from public.ticket_metrics where ticket_id = 'cccccccc-0000-0000-0000-000000000008'));
 
 -- Re-resolving an already Resolved ticket must not restart the window
 update public.ticket_metrics set resolved_at = now() - interval '1 hour' where ticket_id = 'cccccccc-0000-0000-0000-000000000002';
@@ -155,6 +168,14 @@ insert into test_results (test, expected, actual) values
 insert into test_results (test, expected, actual) values
   ('N2 rating saved for Sana', '11111111-1111-1111-1111-111111111111',
      (select agent_id::text from public.csat_ratings where ticket_id = 'cccccccc-0000-0000-0000-000000000002'));
+
+-- N7: rated 2 stars, saved for Ayesha
+insert into test_results (test, expected, actual) values
+  ('N7 rating accepted', 'true',
+     (select public.submit_csat('cccccccc-0000-0000-0000-000000000007', 'aaaaaaaa-0000-0000-0000-000000000107', 2) ->> 'ok'));
+insert into test_results (test, expected, actual) values
+  ('N7 rating saved for Ayesha', '33333333-3333-3333-3333-333333333333',
+     (select agent_id::text from public.csat_ratings where ticket_id = 'cccccccc-0000-0000-0000-000000000007'));
 
 -- N4: not resolved
 insert into test_results (test, expected, actual) values

@@ -9,6 +9,8 @@
 -- * They return totals, averages and medians only, never raw ratings.
 -- * They count only tickets created after launch (ticket_metrics).
 -- * A ticket belongs to the period in which it was created.
+-- * Agent filter: ticket numbers follow the ticket's assigned agent;
+--   CSAT numbers follow the agent who got the rating (at resolve time).
 -- =====================================================================
 
 begin;
@@ -38,20 +40,21 @@ $$;
 --   worked_by_agent  = a human agent replied, or an agent was assigned at resolve
 --   first_reply_sec  = customer's last message before first agent reply -> that reply
 --   resolution_sec   = created -> resolved
+-- Agent filter = the ticket's assigned agent. Ratings are NOT here: use
+-- dash_ratings, which filters by the agent who got the rating.
 create function public.dash_base(p_from timestamptz, p_to timestamptz, p_agent uuid, p_issue text)
 returns table (
-  ticket_id        uuid,
-  created_at       timestamptz,
-  issue_type       text,
+  ticket_id         uuid,
+  created_at        timestamptz,
+  issue_type        text,
   assigned_agent_id uuid,
-  is_ai            boolean,
-  is_human         boolean,
-  is_resolved      boolean,
-  worked_by_agent  boolean,
-  first_reply_sec  float8,
-  resolution_sec   float8,
-  rating           smallint,
-  rating_agent_id  uuid
+  resolved_agent_id uuid,
+  is_ai             boolean,
+  is_human          boolean,
+  is_resolved       boolean,
+  worked_by_agent   boolean,
+  first_reply_sec   float8,
+  resolution_sec    float8
 )
 language sql stable security definer set search_path = public
 as $$
@@ -60,22 +63,43 @@ as $$
     m.ticket_created_at,
     t.issue_type,
     t.assigned_agent_id,
+    m.resolved_agent_id,
     m.first_ai_msg_at is not null,
     m.first_agent_msg_at is not null,
     (t.status = 'Resolved' and m.resolved_at is not null),
     (m.first_agent_msg_at is not null or m.resolved_agent_id is not null),
     extract(epoch from (m.first_agent_msg_at - m.first_reply_start_at))::float8,
     case when t.status = 'Resolved' and m.resolved_at is not null
-         then extract(epoch from (m.resolved_at - m.ticket_created_at))::float8 end,
-    r.rating,
-    r.agent_id
+         then extract(epoch from (m.resolved_at - m.ticket_created_at))::float8 end
   from ticket_metrics m
-  join tickets t           on t.id = m.ticket_id
-  left join csat_ratings r on r.ticket_id = m.ticket_id
+  join tickets t on t.id = m.ticket_id
   where m.ticket_created_at >= p_from
     and m.ticket_created_at <  p_to
     and (p_issue is null or t.issue_type = p_issue)
     and (p_agent is null or t.assigned_agent_id = p_agent);
+$$;
+
+-- One row per rating on a post-launch ticket created in the period.
+-- Agent filter = the agent who got the rating (not the current assignee),
+-- so a ticket reassigned after it was rated still counts for the right agent.
+create function public.dash_ratings(p_from timestamptz, p_to timestamptz, p_agent uuid, p_issue text)
+returns table (
+  ticket_id   uuid,
+  created_at  timestamptz,
+  issue_type  text,
+  rating      smallint,
+  agent_id    uuid
+)
+language sql stable security definer set search_path = public
+as $$
+  select r.ticket_id, m.ticket_created_at, t.issue_type, r.rating, r.agent_id
+  from csat_ratings r
+  join ticket_metrics m on m.ticket_id = r.ticket_id
+  join tickets t        on t.id = r.ticket_id
+  where m.ticket_created_at >= p_from
+    and m.ticket_created_at <  p_to
+    and (p_issue is null or t.issue_type = p_issue)
+    and (p_agent is null or r.agent_id = p_agent);
 $$;
 
 -- Chart block size: day up to 31 days, week up to 120 days, else month
@@ -107,16 +131,19 @@ create function public.dash_overview_tiles(p_from timestamptz, p_to timestamptz,
 returns jsonb
 language sql stable security definer set search_path = public
 as $$
-  select jsonb_build_object(
-    'total',                      count(*),
-    'handled_by_ai',              case when p_agent is null then count(*) filter (where is_ai) end,
-    'assigned_resolved_by_agent', count(*) filter (where is_resolved and worked_by_agent),
-    'first_reply_median_sec',     round((percentile_cont(0.5) within group (order by first_reply_sec))::numeric),
-    'resolution_median_sec',      round((percentile_cont(0.5) within group (order by resolution_sec))::numeric),
-    'csat_avg',                   round(avg(rating), 2),
-    'csat_count',                 count(rating)
-  )
-  from dash_base(p_from, p_to, p_agent, p_issue);
+  select
+    (select jsonb_build_object(
+       'total',                      count(*),
+       'handled_by_ai',              case when p_agent is null then count(*) filter (where is_ai) end,
+       'assigned_resolved_by_agent', count(*) filter (where is_resolved and worked_by_agent),
+       'first_reply_median_sec',     round((percentile_cont(0.5) within group (order by first_reply_sec))::numeric),
+       'resolution_median_sec',      round((percentile_cont(0.5) within group (order by resolution_sec))::numeric))
+     from dash_base(p_from, p_to, p_agent, p_issue))
+    ||
+    (select jsonb_build_object(
+       'csat_avg',   round(avg(rating), 2),
+       'csat_count', count(*))
+     from dash_ratings(p_from, p_to, p_agent, p_issue));
 $$;
 
 -- Agents tiles for one period
@@ -132,19 +159,23 @@ as $$
   from dash_base(p_from, p_to, null, p_issue);
 $$;
 
--- CSAT tiles for one period (rating rate = ratings / all Resolved tickets)
+-- CSAT tiles for one period (rating rate = ratings / Resolved tickets).
+-- With an agent selected, both sides follow the agent who got the rating.
 create function public.dash_csat_tiles(p_from timestamptz, p_to timestamptz, p_agent uuid, p_issue text)
 returns jsonb
 language sql stable security definer set search_path = public
 as $$
   select jsonb_build_object(
-    'csat_avg',    round(avg(rating), 2),
-    'csat_count',  count(rating),
-    'resolved',    count(*) filter (where is_resolved),
-    'rating_rate', case when count(*) filter (where is_resolved) > 0
-                        then round(count(rating)::numeric / count(*) filter (where is_resolved), 4) end
+    'csat_avg',    x.csat_avg,
+    'csat_count',  x.csat_count,
+    'resolved',    y.resolved,
+    'rating_rate', case when y.resolved > 0 then round(x.csat_count::numeric / y.resolved, 4) end
   )
-  from dash_base(p_from, p_to, p_agent, p_issue);
+  from (select round(avg(rating), 2) as csat_avg, count(*) as csat_count
+          from dash_ratings(p_from, p_to, p_agent, p_issue)) x,
+       (select count(*) filter (where b.is_resolved) as resolved
+          from dash_base(p_from, p_to, null, p_issue) b
+         where p_agent is null or b.resolved_agent_id = p_agent) y;
 $$;
 
 -- ---------------------------------------------------------------------
@@ -173,18 +204,20 @@ begin
   v_len  := p_to - p_from;
   v_unit := dash_unit(p_from, p_to);
 
-  -- Ticket volume: three groups that never overlap
+  -- Ticket volume: four groups that never overlap and add up to the total
   select coalesce(jsonb_agg(jsonb_build_object(
            'bucket',        to_char(s.bucket, 'YYYY-MM-DD'),
            'ai_only',       s.ai_only,
            'ai_then_agent', s.ai_then_agent,
-           'agent_only',    s.agent_only) order by s.bucket), '[]'::jsonb)
+           'agent_only',    s.agent_only,
+           'no_reply',      s.no_reply) order by s.bucket), '[]'::jsonb)
     into v_volume
   from (
     select bk.bucket,
-           count(b.ticket_id) filter (where b.is_ai and not b.is_human) as ai_only,
-           count(b.ticket_id) filter (where b.is_ai and b.is_human)     as ai_then_agent,
-           count(b.ticket_id) filter (where not b.is_ai)                as agent_only
+           count(b.ticket_id) filter (where b.is_ai and not b.is_human)     as ai_only,
+           count(b.ticket_id) filter (where b.is_ai and b.is_human)         as ai_then_agent,
+           count(b.ticket_id) filter (where not b.is_ai and b.is_human)     as agent_only,
+           count(b.ticket_id) filter (where not b.is_ai and not b.is_human) as no_reply
     from dash_buckets(p_from, p_to, p_tz) as bk(bucket)
     left join dash_base(p_from, p_to, p_agent, p_issue) b
            on date_trunc(v_unit, b.created_at at time zone p_tz) = bk.bucket
@@ -258,12 +291,12 @@ begin
     group by b.assigned_agent_id
   ),
   rt as (
-    select b.rating_agent_id as agent_id,
-           round(avg(b.rating), 2) as csat_avg,
+    select r.agent_id,
+           round(avg(r.rating), 2) as csat_avg,
            count(*)                as csat_count
-    from b
-    where b.rating is not null and b.rating_agent_id is not null
-    group by b.rating_agent_id
+    from dash_ratings(p_from, p_to, null, p_issue) r
+    where r.agent_id is not null
+    group by r.agent_id
   ),
   ids as (
     select agent_id from per
@@ -330,11 +363,11 @@ begin
     into v_trend
   from (
     select bk.bucket,
-           round(avg(b.rating), 2) as avg_rating,
-           count(b.rating)         as cnt
+           round(avg(r.rating), 2) as avg_rating,
+           count(r.rating)         as cnt
     from dash_buckets(p_from, p_to, p_tz) as bk(bucket)
-    left join dash_base(p_from, p_to, p_agent, p_issue) b
-           on date_trunc(v_unit, b.created_at at time zone p_tz) = bk.bucket
+    left join dash_ratings(p_from, p_to, p_agent, p_issue) r
+           on date_trunc(v_unit, r.created_at at time zone p_tz) = bk.bucket
     group by bk.bucket
   ) s;
 
@@ -343,10 +376,9 @@ begin
     into v_dist
   from generate_series(1, 5) as g(stars)
   left join (
-    select b.rating, count(*) as cnt
-    from dash_base(p_from, p_to, p_agent, p_issue) b
-    where b.rating is not null
-    group by b.rating
+    select r.rating, count(*) as cnt
+    from dash_ratings(p_from, p_to, p_agent, p_issue) r
+    group by r.rating
   ) x on x.rating = g.stars;
 
   -- CSAT by issue
@@ -354,10 +386,9 @@ begin
                             order by x.cnt desc, x.issue_type), '[]'::jsonb)
     into v_issue
   from (
-    select b.issue_type, round(avg(b.rating), 2) as avg_rating, count(*) as cnt
-    from dash_base(p_from, p_to, p_agent, p_issue) b
-    where b.rating is not null
-    group by b.issue_type
+    select r.issue_type, round(avg(r.rating), 2) as avg_rating, count(*) as cnt
+    from dash_ratings(p_from, p_to, p_agent, p_issue) r
+    group by r.issue_type
   ) x;
 
   return jsonb_build_object(
@@ -394,6 +425,7 @@ $$;
 -- ---------------------------------------------------------------------
 revoke all on function public.dash_require_agent()                                   from public, anon, authenticated;
 revoke all on function public.dash_base(timestamptz, timestamptz, uuid, text)         from public, anon, authenticated;
+revoke all on function public.dash_ratings(timestamptz, timestamptz, uuid, text)      from public, anon, authenticated;
 revoke all on function public.dash_unit(timestamptz, timestamptz)                     from public, anon, authenticated;
 revoke all on function public.dash_buckets(timestamptz, timestamptz, text)            from public, anon, authenticated;
 revoke all on function public.dash_overview_tiles(timestamptz, timestamptz, uuid, text) from public, anon, authenticated;

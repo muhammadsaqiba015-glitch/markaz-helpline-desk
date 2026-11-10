@@ -26,6 +26,7 @@ drop function if exists public.dash_agent_tiles(timestamptz, timestamptz, text);
 drop function if exists public.dash_csat_tiles(timestamptz, timestamptz, uuid, text);
 drop function if exists public.dash_buckets(timestamptz, timestamptz, text);
 drop function if exists public.dash_unit(timestamptz, timestamptz);
+drop function if exists public.dash_ratings(timestamptz, timestamptz, uuid, text);
 drop function if exists public.dash_base(timestamptz, timestamptz, uuid, text);
 drop function if exists public.dash_require_agent();
 

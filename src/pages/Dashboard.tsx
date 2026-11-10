@@ -46,6 +46,7 @@ const COLORS = {
   aiOnly: '#2a78d6',
   aiThenAgent: '#eb6834',
   agentOnly: '#17917f',
+  noReply: '#9ca3af',
   star: '#f5a623',
 };
 
@@ -157,8 +158,8 @@ function overviewCsv(d: any): Cell[][] {
     ['CSAT ratings', c.csat_count, p.csat_count],
     [],
     ['Ticket volume'],
-    ['Period starting', 'AI only', 'AI then agent', 'Agent only'],
-    ...(d.volume ?? []).map((v: any) => [v.bucket, v.ai_only, v.ai_then_agent, v.agent_only]),
+    ['Period starting', 'AI only', 'AI then agent', 'Agent only', 'No reply yet'],
+    ...(d.volume ?? []).map((v: any) => [v.bucket, v.ai_only, v.ai_then_agent, v.agent_only, v.no_reply]),
     [],
     ['Tickets by issue (resolved by agents)'],
     ['Issue', 'Tickets'],
@@ -332,7 +333,8 @@ function OverviewTab({ data }: { data: any }) {
                   <Legend wrapperStyle={{ fontSize: 12 }} />
                   <Bar dataKey="ai_only" name="AI only" stackId="v" fill={COLORS.aiOnly} />
                   <Bar dataKey="ai_then_agent" name="AI then agent" stackId="v" fill={COLORS.aiThenAgent} />
-                  <Bar dataKey="agent_only" name="Agent only" stackId="v" fill={COLORS.agentOnly} radius={[3, 3, 0, 0]} />
+                  <Bar dataKey="agent_only" name="Agent only" stackId="v" fill={COLORS.agentOnly} />
+                  <Bar dataKey="no_reply" name="No reply yet" stackId="v" fill={COLORS.noReply} radius={[3, 3, 0, 0]} />
                 </BarChart>
               </ResponsiveContainer>
             </div>

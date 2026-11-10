@@ -42,7 +42,7 @@ create table public.ticket_metrics (
   first_reply_start_at  timestamptz,           -- customer's last message before first agent reply
   human_msg_count       integer not null default 0,
   resolved_at           timestamptz,           -- cleared on reopen, set again on next resolve
-  resolved_agent_id     uuid,                  -- agent assigned at resolve time (gets the rating)
+  resolved_agent_id     uuid,                  -- agent who gets the rating (see trigger 6)
   reopen_count          integer not null default 0,
   updated_at            timestamptz not null default now()
 );
@@ -109,6 +109,8 @@ create trigger csat_a_track_ticket_insert
 -- 6. Trigger: status change -> resolve / reopen
 --    Only a change INTO Resolved stamps the time, so re-resolving an
 --    already Resolved ticket (e.g. bulk resolve) never restarts the window.
+--    The rating goes to the assigned agent; if nobody is assigned, to the
+--    agent who resolved it (resolved_by) — unless the customer closed it.
 -- ---------------------------------------------------------------------
 create function public.csat_on_ticket_status_change()
 returns trigger
@@ -119,7 +121,9 @@ begin
     if new.status = 'Resolved' and old.status is distinct from 'Resolved' then
       update ticket_metrics
          set resolved_at       = now(),
-             resolved_agent_id = new.assigned_agent_id,
+             resolved_agent_id = coalesce(
+                                   new.assigned_agent_id,
+                                   case when new.closed_by is distinct from 'reseller' then new.resolved_by end),
              updated_at        = now()
        where ticket_id = new.id;
     elsif old.status = 'Resolved' and new.status is distinct from 'Resolved' then

@@ -169,7 +169,7 @@ lateral (values
   ('CSAT: 1-star count',            '0',  (select e->>'count' from jsonb_array_elements(d.data->'csat'->'distribution') e where e->>'stars' = '1')),
   ('CSAT by issue: Delivery Issues average', '4.50', (select e->>'csat_avg' from jsonb_array_elements(d.data->'csat'->'by_issue') e where e->>'issue' = 'Delivery Issues')),
   -- Filter options
-  ('Filters: agent list',  '3',    jsonb_array_length(d.data->'options'->'agents')::text),
+  ('Filters: agent list (all agent profiles)', (select count(*)::text from public.agent_profiles), jsonb_array_length(d.data->'options'->'agents')::text),
   ('Filters: issue list has Delivery Issues', 'true', (d.data->'options'->'issues' ? 'Delivery Issues')::text)
 ) as t(test, expected, actual)
 where d.name = 'agent';

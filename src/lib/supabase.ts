@@ -6,11 +6,19 @@ const supabaseAnonKey = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYm
 // Every agent's client subscribes to ticket-wide changes, and bulk assign/resolve
 // plus the AI responder can burst well past the default 10 events/sec — anything
 // over the limit is dropped silently and the list goes stale until a manual refresh.
-export const supabase = createClient(supabaseUrl, supabaseAnonKey, {
-  realtime: {
-    params: { eventsPerSecond: 50 },
-  },
-});
+// Local testing only: during `npm run dev`, .env.local can point the CRM at the test project.
+// Production builds always use the production values above.
+const useTestProject = import.meta.env.DEV && !!import.meta.env.VITE_TEST_SUPABASE_URL;
+
+export const supabase = createClient(
+  useTestProject ? import.meta.env.VITE_TEST_SUPABASE_URL : supabaseUrl,
+  useTestProject ? import.meta.env.VITE_TEST_SUPABASE_ANON_KEY : supabaseAnonKey,
+  {
+    realtime: {
+      params: { eventsPerSecond: 50 },
+    },
+  }
+);
 
 // Database Types
 export interface Ticket {

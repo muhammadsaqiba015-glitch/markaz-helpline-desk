@@ -38,8 +38,12 @@ $$;
 --   is_human         = a human agent sent at least one message ("Human Handled")
 --   is_resolved      = status is Resolved now
 --   worked_by_agent  = a human agent replied, or an agent was assigned at resolve
---   first_reply_sec  = customer's last message before first agent reply -> that reply
+--   first_reply_sec  = start -> first human agent reply, where start is:
+--                        AI replied before the agent: customer's last message before that reply
+--                        otherwise (agent direct):    ticket creation (customer's first message)
 --   resolution_sec   = created -> resolved
+-- Dashboard tiles and the Agents table show the AVERAGE of both. (The JSON
+-- keys keep their old "_median_sec" names so the CRM page needs no change.)
 -- Agent filter = the ticket's assigned agent. Ratings are NOT here: use
 -- dash_ratings, which filters by the agent who got the rating.
 create function public.dash_base(p_from timestamptz, p_to timestamptz, p_agent uuid, p_issue text)
@@ -68,7 +72,11 @@ as $$
     m.first_agent_msg_at is not null,
     (t.status = 'Resolved' and m.resolved_at is not null),
     (m.first_agent_msg_at is not null or m.resolved_agent_id is not null),
-    extract(epoch from (m.first_agent_msg_at - m.first_reply_start_at))::float8,
+    extract(epoch from (m.first_agent_msg_at -
+      case when m.first_ai_msg_at is not null and m.first_ai_msg_at < m.first_agent_msg_at
+           then m.first_reply_start_at   -- AI first: customer's last message before the agent's reply
+           else m.ticket_created_at      -- agent direct: customer's first message (ticket creation)
+      end))::float8,
     case when t.status = 'Resolved' and m.resolved_at is not null
          then extract(epoch from (m.resolved_at - m.ticket_created_at))::float8 end
   from ticket_metrics m
@@ -136,8 +144,8 @@ as $$
        'total',                      count(*),
        'handled_by_ai',              case when p_agent is null then count(*) filter (where is_ai) end,
        'assigned_resolved_by_agent', count(*) filter (where is_resolved and worked_by_agent),
-       'first_reply_median_sec',     round((percentile_cont(0.5) within group (order by first_reply_sec))::numeric),
-       'resolution_median_sec',      round((percentile_cont(0.5) within group (order by resolution_sec))::numeric))
+       'first_reply_median_sec',     round(avg(first_reply_sec)::numeric),   -- average (key name kept)
+       'resolution_median_sec',      round(avg(resolution_sec)::numeric))    -- average (key name kept)
      from dash_base(p_from, p_to, p_agent, p_issue))
     ||
     (select jsonb_build_object(
@@ -284,8 +292,8 @@ begin
            count(*)                                   as assigned_count,
            count(*) filter (where not b.is_resolved)  as open_count,
            count(*) filter (where b.is_resolved)      as resolved_count,
-           round((percentile_cont(0.5) within group (order by b.first_reply_sec))::numeric) as fr_sec,
-           round((percentile_cont(0.5) within group (order by b.resolution_sec))::numeric)  as res_sec
+           round(avg(b.first_reply_sec)::numeric) as fr_sec,    -- average
+           round(avg(b.resolution_sec)::numeric)  as res_sec    -- average
     from b
     where b.assigned_agent_id is not null
     group by b.assigned_agent_id

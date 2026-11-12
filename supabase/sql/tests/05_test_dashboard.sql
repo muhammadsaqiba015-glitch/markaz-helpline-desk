@@ -15,7 +15,10 @@ create temp table dash_out (name text primary key, data jsonb);
 
 -- ---------------------------------------------------------------------
 -- 1. Give the resolved test tickets clear resolution times:
---    N1 1h, N2 2h, N3 3h, N7 3h, N5 4h, N6 5h  -> median 3h (10800 sec)
+--    N1 1h, N2 2h, N3 3h, N7 3h, N5 4h, N6 5h  -> average 3h (10800 sec)
+--    First reply (average): AI-first N2 30m (from customer's +10m message);
+--    agent-direct N3 20m, N4 10m, N5 15m, N6 10m, N7 15m (from creation)
+--    -> 100m / 6 = 16m 40s (1000 sec)
 -- ---------------------------------------------------------------------
 update public.ticket_metrics set resolved_at = ticket_created_at + interval '3 hours' where ticket_id = 'cccccccc-0000-0000-0000-000000000007';
 update public.ticket_metrics set resolved_at = ticket_created_at + interval '1 hour'  where ticket_id = 'cccccccc-0000-0000-0000-000000000001';
@@ -142,8 +145,8 @@ lateral (values
   ('Overview: Total tickets',                    '8',     d.data->'overview'->'current'->>'total'),
   ('Overview: Handled by AI',                    '2',     d.data->'overview'->'current'->>'handled_by_ai'),
   ('Overview: Assigned and Resolved by Agent',   '5',     d.data->'overview'->'current'->>'assigned_resolved_by_agent'),
-  ('Overview: First reply median (15 min)',      '900',   d.data->'overview'->'current'->>'first_reply_median_sec'),
-  ('Overview: Resolution median (3 h)',          '10800', d.data->'overview'->'current'->>'resolution_median_sec'),
+  ('Overview: First reply average (16m 40s)',    '1000',  d.data->'overview'->'current'->>'first_reply_median_sec'),
+  ('Overview: Resolution average (3 h)',         '10800', d.data->'overview'->'current'->>'resolution_median_sec'),
   ('Overview: CSAT average (blended)',           '3.50',  d.data->'overview'->'current'->>'csat_avg'),
   ('Overview: CSAT ratings count',               '4',     d.data->'overview'->'current'->>'csat_count'),
   ('Overview: previous period total',            '0',     d.data->'overview'->'previous'->>'total'),
@@ -171,6 +174,8 @@ lateral (values
   -- Agent comparison rows
   ('Row Sana: assigned',   '2',    (select e->>'assigned'   from jsonb_array_elements(d.data->'agents'->'rows') e where e->>'agent' = 'Sana')),
   ('Row Sana: CSAT',       '4.00', (select e->>'csat_avg'   from jsonb_array_elements(d.data->'agents'->'rows') e where e->>'agent' = 'Sana')),
+  ('Row Sana: 1st reply avg (AI-first N2 30m + direct N5 15m)', '1350', (select e->>'first_reply_median_sec' from jsonb_array_elements(d.data->'agents'->'rows') e where e->>'agent' = 'Sana')),
+  ('Row Ayesha: 1st reply avg (direct N3 20m from creation + N4 10m)', '900', (select e->>'first_reply_median_sec' from jsonb_array_elements(d.data->'agents'->'rows') e where e->>'agent' = 'Ayesha')),
   ('Row Ayesha: open',     '1',    (select e->>'open'       from jsonb_array_elements(d.data->'agents'->'rows') e where e->>'agent' = 'Ayesha')),
   ('Row Ayesha: CSAT only from her own N7 (N3 went to Ahmed)', '2.00', (select e->>'csat_avg' from jsonb_array_elements(d.data->'agents'->'rows') e where e->>'agent' = 'Ayesha')),
   ('Row Ayesha: CSAT count',  '1', (select e->>'csat_count' from jsonb_array_elements(d.data->'agents'->'rows') e where e->>'agent' = 'Ayesha')),

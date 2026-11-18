@@ -44,9 +44,18 @@ async function executeProtocol(protocol: any, collectedParams: Record<string, an
 }
 
 const ESCALATION_PHRASES = [
+  // English
   'handing over', 'hand over', 'handover', 'escalating', 'human agent',
   'live agent', 'agent will', 'team will assist', 'support team will',
+  'transferring to agent', 'transfer to agent', 'transferring you to',
+  'connecting you to', 'routing to an agent', 'passing to an agent',
+  'forwarding to', 'transfer this ticket',
+  // Urdu / Roman Urdu
   'agent se baat', 'agent ko forward', 'insani agent', 'hamara agent',
+  'agent ko transfer', 'transfer kar raha', 'agent tak',
+  'forward kar raha', 'escalate kar', 'agent ke paas',
+  'agent par transfer', 'agent bhejna', 'agent ko bhej',
+  'agent se rabta', 'agent sambhale', 'agent handle',
 ];
 
 function containsEscalation(text: string): boolean {
@@ -209,8 +218,8 @@ Deno.serve(async (req) => {
       .eq('is_active', true)
       .or(`issue_type.eq.${ticket.issue_type},issue_type.is.null`);
 
-    // ── 15. Build Claude tools ────────────────────────────────────────────────
-    const claudeTools = (protocols || []).map((p: any) => {
+    // ── 15. Build tools (OpenAI-compatible format for OpenRouter) ────────────
+    const aiTools = (protocols || []).map((p: any) => {
       const properties: Record<string, any> = {};
       const required: string[] = [];
       for (const param of (p.ai_protocol_params || [])) {
@@ -219,35 +228,47 @@ Deno.serve(async (req) => {
         if (param.required) required.push(safeKey);
       }
       return {
-        name: slugify(p.name),
-        description: p.trigger_description,
-        input_schema: {
-          type: 'object',
-          properties: Object.keys(properties).length
-            ? properties
-            : { details: { type: 'string', description: 'Details' } },
-          required,
+        type: 'function',
+        function: {
+          name: slugify(p.name),
+          description: p.trigger_description,
+          parameters: {
+            type: 'object',
+            properties: Object.keys(properties).length
+              ? properties
+              : { details: { type: 'string', description: 'Details' } },
+            required,
+          },
         },
         _protocol: p,
       };
     });
 
-    const claudeToolsForAPI = claudeTools.map(({ _protocol, ...tool }) => tool);
+    const aiToolsForAPI = aiTools.map(({ _protocol, ...tool }) => tool);
 
     // ── 16. System prompt ─────────────────────────────────────────────────────
     const systemPrompt = `${aiSetting.system_prompt || 'You are a helpful Markaz support agent. Be brief and reply in the same language as the reseller.'}
 
 TICKET: ${ticket.ticket_number} | ${ticket.issue_type} | Order: ${ticket.order_id || 'N/A'} | Reseller: ${ticket.reseller_name} | Phone: ${ticket.reseller_phone}
 AI replies remaining: ${3 - aiReplyCount} of 3.
-${knowledgeContext ? `\nKNOWLEDGE:\n${knowledgeContext}` : ''}`;
+${knowledgeContext ? `\nKNOWLEDGE:\n${knowledgeContext}` : ''}
+
+ESCALATION RULES — follow exactly, no exceptions:
+1. DISPATCH DELAY: If you check order status and find the order has NOT been dispatched and it has been more than 2 days since the order was placed — do NOT mention SLA or give delivery timelines. Your response must: (a) open with a genuine, warm apology acknowledging the delay and that it is unacceptable, (b) briefly explain what action is being taken (transferring to a human agent who will handle it on priority), (c) end by confirming the transfer so the reseller feels reassured. Match the reseller's language (Urdu, Roman Urdu, or English). Keep it concise — 2-3 sentences. Always include the transfer phrase so routing works.
+2. UNRESOLVED ISSUE: If you cannot resolve the issue fully, say you are transferring to agent and stop.
+3. TRANSFER MUST BE EXPLICIT: When transferring, you MUST include the words "transfer kar raha hoon" or "transferring to agent" in your reply. The system uses this phrase to route the ticket — if you do not say it, the ticket will NOT be routed and the reseller will be left waiting. Never say you are transferring without including this phrase.`;
 
     const conversationMessages = historyForClaude.map((m: any) => ({
       role: m.sender_type === 'agent' ? 'assistant' : 'user',
       content: m.message,
     }));
 
-    // ── 17. Agentic loop ──────────────────────────────────────────────────────
-    let loopMessages = [...conversationMessages];
+    // ── 17. Agentic loop (via OpenRouter) ────────────────────────────────────
+    // System prompt goes as the first message in OpenAI-compatible format
+    let loopMessages: any[] = [
+      { role: 'system', content: systemPrompt },
+      ...conversationMessages,
+    ];
     let finalReply = '';
     let toolsUsed: string[] = [];
     let totalInputTokens = 0;
@@ -255,61 +276,63 @@ ${knowledgeContext ? `\nKNOWLEDGE:\n${knowledgeContext}` : ''}`;
     const MAX_ITERATIONS = 3;
 
     for (let i = 0; i < MAX_ITERATIONS; i++) {
-      const claudeBody: any = {
-        model: 'claude-haiku-5-5',
+      const requestBody: any = {
+        model: 'anthropic/claude-haiku-5-5',
         max_tokens: 400,
-        system: systemPrompt,
         messages: loopMessages,
       };
 
-      if (claudeToolsForAPI.length > 0) claudeBody.tools = claudeToolsForAPI;
+      if (aiToolsForAPI.length > 0) requestBody.tools = aiToolsForAPI;
 
-      const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
+      const aiRes = await fetch('https://openrouter.ai/api/v1/chat/completions', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'x-api-key': config.claude_api_key,
-          'anthropic-version': '2023-06-01',
+          'Authorization': `Bearer ${config.claude_api_key}`,
+          'HTTP-Referer': 'https://markaz-helpline-desk.vercel.app',
+          'X-Title': 'Markaz Helpline AI',
         },
-        body: JSON.stringify(claudeBody),
+        body: JSON.stringify(requestBody),
       });
 
-      const claudeData = await claudeRes.json();
-      if (!claudeRes.ok) throw new Error(`Claude error: ${JSON.stringify(claudeData)}`);
+      const aiData = await aiRes.json();
+      if (!aiRes.ok) throw new Error(`OpenRouter error: ${JSON.stringify(aiData)}`);
 
-      totalInputTokens += claudeData.usage?.input_tokens || 0;
-      totalOutputTokens += claudeData.usage?.output_tokens || 0;
+      totalInputTokens += aiData.usage?.prompt_tokens || 0;
+      totalOutputTokens += aiData.usage?.completion_tokens || 0;
 
-      if (claudeData.stop_reason === 'tool_use') {
-        loopMessages.push({ role: 'assistant', content: claudeData.content });
-        const toolResults = [];
+      const choice = aiData.choices?.[0];
+      if (!choice) break;
 
-        for (const block of claudeData.content) {
-          if (block.type !== 'tool_use') continue;
-          const matchedTool = claudeTools.find(t => t.name === block.name);
+      if (choice.finish_reason === 'tool_calls') {
+        loopMessages.push(choice.message); // assistant message with tool_calls array
+
+        for (const tc of (choice.message.tool_calls || [])) {
+          const toolName = tc.function.name;
+          const toolInput = JSON.parse(tc.function.arguments || '{}');
+          const matchedTool = aiTools.find(t => t.function.name === toolName);
           let resultText = 'Tool not found';
 
           if (matchedTool) {
-            toolsUsed.push(matchedTool.name);
-            resultText = await executeProtocol(matchedTool._protocol, block.input || {});
+            toolsUsed.push(toolName);
+            resultText = await executeProtocol(matchedTool._protocol, toolInput);
 
             await supabase.from('internal_notes').insert({
               ticket_id: ticket.id,
               agent_id: null,
               agent_name: 'Markaz AI',
-              note_text: `🤖 ${matchedTool.name}\nParams: ${JSON.stringify(block.input)}\nResult: ${resultText.slice(0, 200)}`,
+              note_text: `🤖 ${toolName}\nParams: ${JSON.stringify(toolInput)}\nResult: ${resultText.slice(0, 200)}`,
             });
           }
 
-          toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: resultText });
+          // Each tool result is a separate message in OpenAI format
+          loopMessages.push({ role: 'tool', tool_call_id: tc.id, content: resultText });
         }
 
-        loopMessages.push({ role: 'user', content: toolResults });
         continue;
       }
 
-      const textBlock = claudeData.content?.find((b: any) => b.type === 'text');
-      finalReply = textBlock?.text || '';
+      finalReply = choice.message?.content || '';
       break;
     }
 
@@ -334,27 +357,26 @@ ${knowledgeContext ? `\nKNOWLEDGE:\n${knowledgeContext}` : ''}`;
     // ── 19. Check escalation — move to unassigned if escalated ────────────────
     const escalated = containsEscalation(finalReply);
 
-    await Promise.all([
-      // If escalated — mark ai_escalated, remove ai_handled so it moves to unassigned
-      escalated
-        ? supabase.from('tickets').update({
-            ai_escalated: true,
-            ai_handled: false,
-          }).eq('id', ticket.id)
-        : Promise.resolve(),
+    // Single ticket update (avoids race condition from two concurrent updates on same row)
+    const ticketUpdate: Record<string, any> = {
+      latest_message: finalReply.slice(0, 200),
+      latest_message_at: new Date().toISOString(),
+      latest_message_sender: 'agent',
+      status: ticket.status === 'Pending' ? 'In Progress' : ticket.status,
+    };
+    if (escalated) {
+      ticketUpdate.ai_escalated = true;
+      ticketUpdate.ai_handled = false;
+    }
 
-      supabase.from('tickets').update({
-        latest_message: finalReply.slice(0, 200),
-        latest_message_at: new Date().toISOString(),
-        latest_message_sender: 'agent',
-        status: ticket.status === 'Pending' ? 'In Progress' : ticket.status,
-      }).eq('id', ticket.id),
+    await Promise.all([
+      supabase.from('tickets').update(ticketUpdate).eq('id', ticket.id),
 
       supabase.from('ai_logs').insert({
         ticket_id: ticket.id,
         message_id: newMessage.id,
         issue_type: ticket.issue_type,
-        action_taken: toolsUsed.length ? `tools:${toolsUsed.join(',')}` : 'replied',
+        action_taken: toolsUsed.length ? `tools:${toolsUsed.join(',')}` : (escalated ? 'escalated' : 'replied'),
         response_received: finalReply.slice(0, 200),
         input_tokens: totalInputTokens,
         output_tokens: totalOutputTokens,

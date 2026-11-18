@@ -118,16 +118,22 @@ const TicketList = ({ currentView, selectedTicketId, onSelectTicket, onTicketOpe
 
     const sortGroup = (tickets: Ticket[]) => {
       if (sortBy === 'unread') {
-        // Unread first, then most recent activity. This is a sort, not a filter —
-        // it must never remove tickets from the agent's list.
         return tickets.sort((a, b) =>
           Number(!!b.unread_by_agent) - Number(!!a.unread_by_agent) ||
           new Date(b.latest_message_at || b.created_at).getTime() - new Date(a.latest_message_at || a.created_at).getTime()
         );
       } else if (sortBy === 'newest') {
-        return tickets.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
-      } else if (sortBy === 'oldest' || sortBy === 'longest-wait') {
+        // Sort by most recent activity (latest message), not ticket creation date
+        return tickets.sort((a, b) =>
+          new Date(b.latest_message_at || b.created_at).getTime() - new Date(a.latest_message_at || a.created_at).getTime()
+        );
+      } else if (sortBy === 'oldest') {
         return tickets.sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime());
+      } else if (sortBy === 'longest-wait') {
+        // Sort by how long since the reseller's last message went unanswered
+        return tickets.sort((a, b) =>
+          new Date(a.latest_message_at || a.created_at).getTime() - new Date(b.latest_message_at || b.created_at).getTime()
+        );
       }
       return tickets;
     };

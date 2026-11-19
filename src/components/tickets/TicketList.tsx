@@ -113,35 +113,32 @@ const TicketList = ({ currentView, selectedTicketId, onSelectTicket, onTicketOpe
       filtered = filtered.filter(t => t.status === statusFilter);
     }
 
-    // "Newest First" and "Oldest First" are global sorts — grouping must not override them
-    if (sortBy === 'newest') {
-      return [...filtered].sort((a, b) =>
-        new Date(b.latest_message_at || b.created_at).getTime() - new Date(a.latest_message_at || a.created_at).getTime()
-      );
-    }
-    if (sortBy === 'oldest') {
-      return [...filtered].sort((a, b) =>
-        new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
-      );
-    }
-
-    // "Unread" and "Longest Wait" use grouping: unanswered tickets always bubble above answered ones
+    // Always group: reseller-last tickets (needs reply) bubble above agent-last (already replied).
+    // This applies to every sort option so that a new customer message always rises to the top,
+    // even on the AI Handling tab where every ticket has been replied to by the AI.
     const needsReply = filtered.filter(t => !t.latest_message_sender || t.latest_message_sender === 'reseller');
     const alreadyReplied = filtered.filter(t => t.latest_message_sender === 'agent');
 
-    if (sortBy === 'unread') {
-      const sortUnread = (arr: Ticket[]) => arr.sort((a, b) =>
-        Number(!!b.unread_by_agent) - Number(!!a.unread_by_agent) ||
-        new Date(b.latest_message_at || b.created_at).getTime() - new Date(a.latest_message_at || a.created_at).getTime()
-      );
-      return [...sortUnread(needsReply), ...sortUnread(alreadyReplied)];
+    if (sortBy === 'newest') {
+      const byNewest = (a: Ticket, b: Ticket) =>
+        new Date(b.latest_message_at || b.created_at).getTime() - new Date(a.latest_message_at || a.created_at).getTime();
+      return [...needsReply.sort(byNewest), ...alreadyReplied.sort(byNewest)];
     }
-
+    if (sortBy === 'oldest') {
+      const byOldest = (a: Ticket, b: Ticket) =>
+        new Date(a.created_at).getTime() - new Date(b.created_at).getTime();
+      return [...needsReply.sort(byOldest), ...alreadyReplied.sort(byOldest)];
+    }
+    if (sortBy === 'unread') {
+      const byUnread = (a: Ticket, b: Ticket) =>
+        Number(!!b.unread_by_agent) - Number(!!a.unread_by_agent) ||
+        new Date(b.latest_message_at || b.created_at).getTime() - new Date(a.latest_message_at || a.created_at).getTime();
+      return [...needsReply.sort(byUnread), ...alreadyReplied.sort(byUnread)];
+    }
     // longest-wait: who has been waiting for a reply the longest
-    const sortOldestActivity = (arr: Ticket[]) => arr.sort((a, b) =>
-      new Date(a.latest_message_at || a.created_at).getTime() - new Date(b.latest_message_at || b.created_at).getTime()
-    );
-    return [...sortOldestActivity(needsReply), ...sortOldestActivity(alreadyReplied)];
+    const byOldestActivity = (a: Ticket, b: Ticket) =>
+      new Date(a.latest_message_at || a.created_at).getTime() - new Date(b.latest_message_at || b.created_at).getTime();
+    return [...needsReply.sort(byOldestActivity), ...alreadyReplied.sort(byOldestActivity)];
   }, [allTickets, currentView, profile, topicFilter, statusFilter, searchQuery, sortBy, searchResults, searchedQuery]);
 
   useEffect(() => {
